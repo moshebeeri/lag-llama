@@ -1,0 +1,9 @@
+gluonts[torch]<=0.14.4
+numpy>=1.23.5
+torch>=2.2.0  # Recent version with better Apple Silicon support
+wandb
+scipy
+pandas>=2.1.4
+huggingface_hub[cli]
+matplotlib
+yfinance>=0.2.36 

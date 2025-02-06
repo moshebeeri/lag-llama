@@ -77,6 +77,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+*/.ipynb_checkpoints/*
 
 # IPython
 profile_default/
@@ -173,3 +174,50 @@ notebooks
 datasets
 *ckpt
 *tar.gz
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Data
+data/*
+!data/.gitkeep
+
+# Models
+models/*
+!models/.gitkeep
+
+# Output
+output/*
+!output/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+*.log
+
+# Mac
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Project specific
+*.csv
+*.json
+config.dev.yaml
+config.prod.yaml
+tech_forecasts.csv
+tech_correlations.png
+
+# Credentials
+*_key.txt
+*_secret.txt
+credentials.yaml

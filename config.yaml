@@ -1,0 +1,28 @@
+model:
+  context_length: 32
+  forecast_days: [1, 2, 3, 5, 8]
+  
+data:
+  history_days: 90
+  tickers:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - NVDA
+    - META
+    - TSM
+    - AVGO
+    - ASML
+    - AMD
+
+paths:
+  data_dir: "data"
+  models_dir: "models"
+  output_dir: "output"
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  max_epochs: 100
+  early_stopping_patience: 50 
