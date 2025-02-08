@@ -20,6 +20,7 @@ import torch.nn.functional as F
 import traceback
 from pathlib import Path
 import matplotlib.dates as mdates
+import csv
 
 # Monkey-patch torch.distributions.StudentT to define a custom expand method
 from torch.distributions.studentT import StudentT as TorchStudentT
@@ -53,6 +54,13 @@ TECH_TICKERS = [
 ]
 
 PREDICTION_LENGTH = 32
+
+# Constants for prediction horizons
+PREDICTION_HORIZONS = {
+    '2d': 2,
+    '1w': 5,  # business week
+    '1m': 21  # business month
+}
 
 def create_time_features(idx):
     """Create time features for a given index."""
@@ -157,7 +165,7 @@ def validate_dimensions(past_target, past_observed_values, past_time_feat, futur
         assert future_time_feat.shape[2] == past_time_feat.shape[2], f"Future time features dimension doesn't match: future_time_feat {future_time_feat.shape[2]} vs past_time_feat {past_time_feat.shape[2]}"
         assert future_time_feat.shape[1] == past_time_feat.shape[1], f"Future time features sequence length doesn't match: future_time_feat {future_time_feat.shape[1]} vs past_time_feat {past_time_feat.shape[1]}"
 
-def prepare_data_for_lagllama(data, dates, model, total_required=752):
+def prepare_data_for_lagllama(data, dates, model, horizon_days=2, total_required=752):
     """
     Prepare data for Lag-Llama model using returns instead of raw prices.
     
@@ -165,6 +173,7 @@ def prepare_data_for_lagllama(data, dates, model, total_required=752):
         data: Historical stock data (pd.Series)
         dates: Index of dates
         model: LagLlama model instance
+        horizon_days: Number of days to forecast
         total_required: Minimum number of data points needed
     """
     # Ensure we have enough data
@@ -178,10 +187,10 @@ def prepare_data_for_lagllama(data, dates, model, total_required=752):
     returns = returns[-(total_required):]
     dates = dates[-(total_required):]
     
-    # Create future dates for forecast with same length as past data
+    # Create future dates for the specific horizon
     future_dates = pd.date_range(
         start=dates[-1] + pd.Timedelta(days=1),
-        periods=len(dates),
+        periods=horizon_days,
         freq='B'
     )
     
@@ -212,14 +221,25 @@ def prepare_data_for_lagllama(data, dates, model, total_required=752):
     # Convert to tensors and add batch and feature dimensions
     past_target = torch.tensor(returns, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)  # [1, seq_len, 1]
     past_time_feat = torch.tensor(past_time_feat, dtype=torch.float32).unsqueeze(0)     # [1, seq_len, 6]
-    future_time_feat = torch.tensor(future_time_feat, dtype=torch.float32).unsqueeze(0)  # [1, seq_len, 6]
+    
+    # Create future time features with same sequence length as past
+    padded_future_time_feat = np.zeros((total_required, 6))  # Initialize with zeros
+    padded_future_time_feat[:horizon_days] = future_time_feat  # Fill first horizon_days with actual features
+    future_time_feat = torch.tensor(padded_future_time_feat, dtype=torch.float32).unsqueeze(0)  # [1, seq_len, 6]
+    
+    # Create past observed values tensor (all 1s since we're using clean data)
+    past_observed_values = torch.ones_like(past_target)
     
     # Move tensors to the correct device
     past_target = past_target.to(DEVICE)
     past_time_feat = past_time_feat.to(DEVICE)
     future_time_feat = future_time_feat.to(DEVICE)
+    past_observed_values = past_observed_values.to(DEVICE)
     
-    return past_target, past_time_feat, future_time_feat
+    # Validate tensor dimensions
+    validate_dimensions(past_target, past_observed_values, past_time_feat, future_time_feat)
+    
+    return past_target, past_observed_values, past_time_feat, future_time_feat
 
 def load_lagllama_model(context_length=128):
     """Load the Lag-Llama model."""
@@ -283,6 +303,64 @@ def load_lagllama_model(context_length=128):
     model.load_state_dict(new_state_dict)
     return model
 
+def load_prediction_history():
+    """Load historical predictions from CSV file."""
+    history_file = "data/prediction_history.csv"
+    if not os.path.exists(history_file):
+        return pd.DataFrame()
+    return pd.read_csv(history_file, parse_dates=['prediction_date', 'target_date'])
+
+def save_prediction(ticker: str, prediction_date: datetime, target_date: datetime, 
+                   predicted_value: float, horizon: str, actual_value: float = None):
+    """Save prediction to CSV file with tracking information."""
+    history_file = "data/prediction_history.csv"
+    os.makedirs("data", exist_ok=True)
+    
+    # Create file with headers if it doesn't exist
+    if not os.path.exists(history_file):
+        with open(history_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['ticker', 'prediction_date', 'target_date', 'horizon',
+                           'predicted_value', 'actual_value', 'accuracy_pct'])
+    
+    # Append new prediction
+    with open(history_file, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            ticker,
+            prediction_date.strftime('%Y-%m-%d'),
+            target_date.strftime('%Y-%m-%d'),
+            horizon,
+            predicted_value,
+            actual_value if actual_value is not None else '',
+            ((actual_value - predicted_value) / predicted_value * 100) if actual_value is not None else ''
+        ])
+
+def update_prediction_accuracy():
+    """Update accuracy of past predictions using current market data."""
+    df = load_prediction_history()
+    if df.empty:
+        return
+    
+    # Get current market data for validation
+    current_data = get_historical_data(tickers=TECH_TICKERS)
+    
+    # Update predictions where we now have actual values
+    updated_rows = []
+    for _, row in df.iterrows():
+        if pd.isna(row['actual_value']) and row['target_date'] <= pd.Timestamp.now():
+            ticker_data = current_data[row['ticker']]
+            target_date = pd.Timestamp(row['target_date'])
+            if target_date in ticker_data.index:
+                actual_value = ticker_data[target_date]
+                accuracy_pct = (actual_value - row['predicted_value']) / row['predicted_value'] * 100
+                row['actual_value'] = actual_value
+                row['accuracy_pct'] = accuracy_pct
+        updated_rows.append(row)
+    
+    # Save updated predictions
+    pd.DataFrame(updated_rows).to_csv("data/prediction_history.csv", index=False)
+
 def forecast_stock(model, data, dates):
     """
     Generate forecasts for a stock using the LagLlama model.
@@ -295,11 +373,6 @@ def forecast_stock(model, data, dates):
     Returns:
         dict: Dictionary containing forecast information
     """
-    # Prepare data for the model using returns
-    past_target, past_time_feat, future_time_feat = prepare_data_for_lagllama(
-        data, dates, model
-    )
-    
     # Get the last historical value for converting returns back to prices
     last_value = float(data.iloc[-1])
     print(f"Last historical value: {last_value:.2f}")
@@ -313,42 +386,80 @@ def forecast_stock(model, data, dates):
     print(f"5-day momentum: {momentum*100:.2f}%")
     print(f"30-day avg return: {avg_return*100:.2f}%")
     
-    # Generate forecasts
-    with torch.no_grad():
-        params, loc, scale = model(
-            past_target=past_target,
-            past_time_feat=past_time_feat,
-            future_time_feat=future_time_feat
+    forecasts = {}
+    current_date = pd.Timestamp.now()
+    
+    # Generate forecasts for each horizon
+    for horizon_name, horizon_days in PREDICTION_HORIZONS.items():
+        print(f"\nGenerating {horizon_name} forecast...")
+        
+        # Prepare data specifically for this horizon
+        past_target, past_observed_values, past_time_feat, future_time_feat = prepare_data_for_lagllama(
+            data, dates, model, horizon_days=horizon_days
         )
         
-        # Create distribution from parameters
-        distr = model.distr_output.distribution(params, loc, scale)
-        
-        # Get predicted returns
-        predicted_returns = distr.mean.cpu().numpy().squeeze()
-        
-        # Convert returns to price forecasts
-        forecast_values = np.zeros(2)
-        prev_value = last_value
-        
-        for i in range(2):
-            # Get the predicted return and apply volatility-based adjustment
-            predicted_return = predicted_returns[i]
+        with torch.no_grad():
+            # Reset model's cache for each new horizon
+            model.reset_cache()
             
-            # Apply volatility-based scaling to the predicted return
-            volatility_scale = np.clip(daily_std / 0.02, 0.5, 2.0)  # Scale based on historical volatility
-            predicted_return = predicted_return / volatility_scale
+            # Generate predictions
+            transformer_input, loc, scale = model.prepare_input(
+                past_target=past_target,
+                past_time_feat=past_time_feat,
+                future_time_feat=future_time_feat,
+                past_observed_values=past_observed_values
+            )
             
-            # Calculate the price prediction
-            forecast_values[i] = prev_value * (1 + predicted_return)
-            prev_value = forecast_values[i]
-    
-    print(f"Forecast values: {forecast_values[0]:.2f}")
-    print(f"                 {forecast_values[1]:.2f}")
+            # Forward pass through the model
+            x = model.transformer.wte(transformer_input)
+            for block in model.transformer.h:
+                x = block(x, use_kv_cache=False)
+            x = model.transformer.ln_f(x)
+            params = model.param_proj(x)
+            
+            # Create distribution from parameters
+            distr = model.distr_output.distribution(params, loc, scale)
+            
+            # Get predicted returns
+            predicted_returns = distr.mean.cpu().numpy().squeeze()
+            
+            # Convert returns to price forecasts
+            forecast_values = np.zeros(horizon_days)
+            prev_value = last_value
+            
+            for i in range(horizon_days):
+                # Get the predicted return and apply volatility-based adjustment
+                predicted_return = predicted_returns[i]
+                
+                # Apply volatility-based scaling to the predicted return
+                volatility_scale = np.clip(daily_std / 0.02, 0.5, 2.0)  # Scale based on historical volatility
+                predicted_return = predicted_return / volatility_scale
+                
+                # Calculate the price prediction
+                forecast_values[i] = prev_value * (1 + predicted_return)
+                prev_value = forecast_values[i]
+                
+                # Save prediction to history
+                target_date = current_date + pd.Timedelta(days=i+1)
+                save_prediction(
+                    ticker=data.name,
+                    prediction_date=current_date,
+                    target_date=target_date,
+                    predicted_value=forecast_values[i],
+                    horizon=horizon_name
+                )
+            
+            forecasts[horizon_name] = forecast_values
+            print(f"{horizon_name} Forecast values:")
+            for i, value in enumerate(forecast_values):
+                print(f"Day {i+1}: {value:.2f} ({(value/last_value - 1)*100:+.2f}%)")
     
     return {
         'last_historical_value': last_value,
-        'forecast_values': forecast_values
+        'forecasts': forecasts,
+        'volatility': daily_std,
+        'momentum': momentum,
+        'avg_return': avg_return
     }
 
 def test_lagllama_dimensions(model, lag_indices):
@@ -449,6 +560,9 @@ def save_forecasts(ticker, forecasts):
     print(f"Saved forecasts for {ticker} to {output_file}")
 
 def main():
+    # Update accuracy of past predictions
+    update_prediction_accuracy()
+    
     # Load the model with larger context length
     print("Loading model...")
     model = load_lagllama_model(context_length=256)
@@ -467,32 +581,68 @@ def main():
     for stock in stocks:
         print(f"\nProcessing {stock}:")
         stock_data = data[stock]
+        stock_data.name = stock  # Set series name for reference
         dates = data.index
         
         try:
             forecast_data = forecast_stock(model, stock_data, dates)
-            forecast_results.append({
-                'Ticker': stock,
-                'Last Value': forecast_data['last_historical_value'],
-                'Day 1': forecast_data['forecast_values'][0],
-                'Day 2': forecast_data['forecast_values'][1],
-                'Day 1 Change': ((forecast_data['forecast_values'][0] / forecast_data['last_historical_value'] - 1) * 100),
-                'Day 2 Change': ((forecast_data['forecast_values'][1] / forecast_data['last_historical_value'] - 1) * 100)
-            })
+            
+            # Store results for each horizon
+            for horizon, values in forecast_data['forecasts'].items():
+                forecast_results.append({
+                    'Ticker': stock,
+                    'Last Value': forecast_data['last_historical_value'],
+                    'Horizon': horizon,
+                    'Values': values,
+                    'Percent Changes': (values - forecast_data['last_historical_value']) / forecast_data['last_historical_value'] * 100
+                })
         except Exception as e:
             print(f"Error forecasting {stock}: {str(e)}")
             traceback.print_exc()
     
     # Display results in a simplified table
     if forecast_results:
-        print("\n" + "="*100)
+        print("\n" + "="*120)
         print("Stock Price Forecasts")
-        print("="*100)
-        print(f"{'Ticker':<8} {'Last Price':<12} {'Day 1':<12} {'Day 2':<12} {'Day 1 %':<10} {'Day 2 %':<10}")
+        print("="*120)
+        
+        for horizon in PREDICTION_HORIZONS.keys():
+            print(f"\n{horizon} Horizon Forecasts:")
+            print("-"*120)
+            print(f"{'Ticker':<8} {'Last Price':<12} {'Final Price':<12} {'Max Change %':<12} {'Min Change %':<12} {'Avg Change %':<12}")
+            print("-"*120)
+            
+            for result in forecast_results:
+                if result['Horizon'] == horizon:
+                    print(f"{result['Ticker']:<8} "
+                          f"${result['Last Value']:<11.2f} "
+                          f"${result['Values'][-1]:<11.2f} "
+                          f"{max(result['Percent Changes']):>11.2f}% "
+                          f"{min(result['Percent Changes']):>11.2f}% "
+                          f"{np.mean(result['Percent Changes']):>11.2f}%")
+        print("="*120)
+        
+        # Add summary table for average predictions
+        print("\nSummary of Average Predictions:")
         print("-"*100)
-        for result in forecast_results:
-            print(f"{result['Ticker']:<8} ${result['Last Value']:<11.2f} ${result['Day 1']:<11.2f} ${result['Day 2']:<11.2f} {result['Day 1 Change']:>9.2f}% {result['Day 2 Change']:>9.2f}%")
-        print("="*100)
+        print(f"{'Ticker':<8} {'Next Day %':<12} {'2d Avg %':<12} {'1w Avg %':<12} {'1m Avg %':<12}")
+        print("-"*100)
+        
+        for stock in stocks:
+            stock_results = {horizon: [] for horizon in PREDICTION_HORIZONS.keys()}
+            next_day_change = None
+            for result in forecast_results:
+                if result['Ticker'] == stock:
+                    stock_results[result['Horizon']] = np.mean(result['Percent Changes'])
+                    if result['Horizon'] == '2d':  # Get next day prediction from 2d forecast
+                        next_day_change = result['Percent Changes'][0]
+            
+            print(f"{stock:<8} "
+                  f"{next_day_change:>11.2f}% "
+                  f"{stock_results['2d']:>11.2f}% "
+                  f"{stock_results['1w']:>11.2f}% "
+                  f"{stock_results['1m']:>11.2f}%")
+        print("-"*100)
 
 if __name__ == '__main__':
     main() 
