@@ -301,6 +301,15 @@ def forecast_stock(model, data, dates):
     last_value = float(data.iloc[-1])
     print(f"Last historical value: {last_value:.2f}")
     
+    # Calculate historical volatility and momentum
+    recent_returns = np.diff(data[-30:].values) / data[-30:-1].values
+    daily_std = np.std(recent_returns)
+    momentum = np.mean(recent_returns[-5:])  # Use last 5 days for momentum
+    avg_return = np.mean(recent_returns)     # Average return over 30 days
+    print(f"Historical 30-day volatility: {daily_std*100:.2f}%")
+    print(f"5-day momentum: {momentum*100:.2f}%")
+    print(f"30-day avg return: {avg_return*100:.2f}%")
+    
     # Generate forecasts
     with torch.no_grad():
         params, loc, scale = model(
@@ -312,33 +321,45 @@ def forecast_stock(model, data, dates):
         # Create distribution from parameters
         distr = model.distr_output.distribution(params, loc, scale)
         
-        # Get mean predictions and scale them properly
-        forecast_means = distr.mean.cpu().numpy().squeeze()
-        forecast_scale = float(scale.cpu().numpy())  # Convert to scalar
-        forecast_loc = float(loc.cpu().numpy())  # Convert to scalar
+        # Get mean predictions
+        mean = distr.mean.cpu().numpy().squeeze()
         
-        # Calculate volatility from recent data (last 30 days)
-        recent_returns = np.diff(data[-30:].values) / data[-30:-1].values
-        volatility = np.std(recent_returns)
-        
-        # Scale predictions based on recent volatility
+        # Adjust predictions based on stock's characteristics
         forecast_values = np.zeros(2)
+        prev_value = last_value
+        
         for i in range(2):
-            # Get the model's predicted relative change
-            relative_change = forecast_means[i] * forecast_scale + forecast_loc
+            # Get base prediction and scale it down
+            base_return = mean[i] * 0.05  # Further reduce base prediction
             
-            # Scale the change based on recent volatility
-            scaled_change = relative_change * (volatility / 0.02)  # Normalize to 2% baseline volatility
+            # Calculate individual components
+            volatility_component = (daily_std - 0.015) / 0.015  # Relative to 1.5% baseline
+            momentum_component = momentum * 2
+            trend_component = avg_return
             
-            # Apply reasonable limits
-            max_daily_change = min(0.05, volatility * 2)  # Cap at 5% or 2x volatility
-            scaled_change = np.clip(scaled_change, -max_daily_change, max_daily_change)
+            # Weight the components differently based on their magnitudes
+            volatility_weight = np.clip(abs(volatility_component), 0, 1)
+            momentum_weight = np.clip(abs(momentum_component), 0, 1)
+            trend_weight = np.clip(abs(trend_component), 0, 1)
             
-            # Calculate the new value
-            prev_value = last_value if i == 0 else forecast_values[i-1]
-            forecast_values[i] = prev_value * (1 + scaled_change)
+            # Combine components with their weights
+            adjusted_return = (
+                base_return +
+                (volatility_component * 0.003 * volatility_weight) +
+                (momentum_component * 0.002 * momentum_weight) +
+                (trend_component * 0.004 * trend_weight)
+            )
+            
+            # Apply softer bounds based on volatility
+            max_daily_return = daily_std * 1.2  # More flexible cap based on volatility
+            adjusted_return = np.clip(adjusted_return, -max_daily_return, max_daily_return)
+            
+            # Calculate the price prediction
+            forecast_values[i] = prev_value * (1 + adjusted_return)
+            prev_value = forecast_values[i]
     
-    print(f"Forecast values: {forecast_values[0]:.2f}, {forecast_values[1]:.2f}")
+    print(f"Forecast values: {forecast_values[0]:.2f}")
+    print(f"                 {forecast_values[1]:.2f}")
     
     return {
         'last_historical_value': last_value,
@@ -445,13 +466,12 @@ def save_forecasts(ticker, forecasts):
 def main():
     # Load the model with larger context length
     print("Loading model...")
-    model = load_lagllama_model(context_length=256)  # Increased from 128
+    model = load_lagllama_model(context_length=256)
     model.eval()
     
     # Get stock data
     print("\nFetching stock data...")
-    stocks = TECH_TICKERS  # Use all tickers including NASDAQ-100 index
-    all_series_data = {}
+    stocks = TECH_TICKERS
     
     # Fetch all stock data at once
     data = get_historical_data(tickers=stocks)
@@ -461,34 +481,33 @@ def main():
     
     for stock in stocks:
         print(f"\nProcessing {stock}:")
-        stock_data = data[stock]  # This is now a pd.Series
+        stock_data = data[stock]
         dates = data.index
         
         try:
             forecast_data = forecast_stock(model, stock_data, dates)
             forecast_results.append({
                 'Ticker': stock,
-                'Last Value': f"${forecast_data['last_historical_value']:.2f}",
-                'Forecast Day 1': f"${forecast_data['forecast_values'][0]:.2f}",
-                'Forecast Day 2': f"${forecast_data['forecast_values'][1]:.2f}",
-                'Day 1 Change': f"{((forecast_data['forecast_values'][0] / forecast_data['last_historical_value'] - 1) * 100):.1f}%",
-                'Day 2 Change': f"{((forecast_data['forecast_values'][1] / forecast_data['last_historical_value'] - 1) * 100):.1f}%"
+                'Last Value': forecast_data['last_historical_value'],
+                'Day 1': forecast_data['forecast_values'][0],
+                'Day 2': forecast_data['forecast_values'][1],
+                'Day 1 Change': ((forecast_data['forecast_values'][0] / forecast_data['last_historical_value'] - 1) * 100),
+                'Day 2 Change': ((forecast_data['forecast_values'][1] / forecast_data['last_historical_value'] - 1) * 100)
             })
-            all_series_data[stock] = forecast_data
         except Exception as e:
             print(f"Error forecasting {stock}: {str(e)}")
             traceback.print_exc()
     
-    # Display results in a nicely formatted table
+    # Display results in a simplified table
     if forecast_results:
-        print("\n" + "="*120)
+        print("\n" + "="*100)
         print("Stock Price Forecasts")
-        print("="*120)
-        print(f"{'Ticker':<8} {'Last Price':<12} {'Day 1 Price':<12} {'Day 2 Price':<12} {'Day 1 Change':<12} {'Day 2 Change':<12}")
-        print("-"*120)
+        print("="*100)
+        print(f"{'Ticker':<8} {'Last Price':<12} {'Day 1':<12} {'Day 2':<12} {'Day 1 %':<10} {'Day 2 %':<10}")
+        print("-"*100)
         for result in forecast_results:
-            print(f"{result['Ticker']:<8} {result['Last Value']:<12} {result['Forecast Day 1']:<12} {result['Forecast Day 2']:<12} {result['Day 1 Change']:<12} {result['Day 2 Change']:<12}")
-        print("="*120)
+            print(f"{result['Ticker']:<8} ${result['Last Value']:<11.2f} ${result['Day 1']:<11.2f} ${result['Day 2']:<11.2f} {result['Day 1 Change']:>9.2f}% {result['Day 2 Change']:>9.2f}%")
+        print("="*100)
 
 if __name__ == '__main__':
     main() 
