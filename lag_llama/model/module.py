@@ -14,7 +14,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -426,14 +426,20 @@ class LagLlamaModel(nn.Module):
         num_parallel_samples: int = 100,
         time_feat: bool = True,
         dropout: float = 0.0,
+        feature_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.context_length = context_length
         self.lags_seq = lags_seq
-        if time_feat:
-            feature_size = input_size * (len(self.lags_seq)) + 2 * input_size + 6
-        else:
-            feature_size = input_size * (len(self.lags_seq)) + 2 * input_size
+        
+        # Calculate feature size based on what we concatenate in prepare_input
+        if feature_size is None:
+            if time_feat:
+                # lags + past_target + past_time_feat + future_time_feat + static_feat
+                feature_size = input_size * len(self.lags_seq) + input_size + 6 + 6 + 2
+            else:
+                # lags + past_target + static_feat
+                feature_size = input_size * len(self.lags_seq) + input_size + 2
 
         config = LTSMConfig(
             n_layer=n_layer,
@@ -484,79 +490,75 @@ class LagLlamaModel(nn.Module):
     def prepare_input(
         self,
         past_target: torch.Tensor,
-        past_observed_values: torch.Tensor,
-        past_time_feat: Optional[torch.Tensor] = None,
-        future_time_feat: Optional[torch.Tensor] = None,
-        future_target: Optional[torch.Tensor] = None,
-    ):
+        past_time_feat: torch.Tensor,
+        future_time_feat: torch.Tensor,
+        past_observed_values: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Prepare input for the transformer by:
+        1. Computing scale and location parameters
+        2. Scaling the target
+        3. Computing lags
+        4. Concatenating everything together
+
+        Args:
+            past_target: Past target values [batch_size, seq_len, 1]
+            past_time_feat: Past time features [batch_size, seq_len, n_features]
+            future_time_feat: Future time features [batch_size, seq_len, n_features]
+            past_observed_values: Binary mask indicating observed values [batch_size, seq_len, 1]
+
+        Returns:
+            transformer_input: Input tensor for transformer
+            loc: Location parameter
+            scale: Scale parameter
+        """
+        if past_observed_values is None:
+            past_observed_values = torch.ones_like(past_target)
+
+        # Compute scale and location parameters
         scaled_past_target, loc, scale = self.scaler(
-            past_target, past_observed_values
-        )  # Data is standardized (past_observed_values is passed as "weights" parameter) # (bsz, context_length+max(self.lags_seq)
+            past_target,
+            past_observed_values,
+        )
 
-        # In the below code, instead of max(self.lags_seq), it was previously -self.context_length
-        if future_target is not None:
-            input = torch.cat(
-                (
-                    scaled_past_target[..., max(self.lags_seq) :],  # Just the context
-                    (future_target[..., :-1] - loc)
-                    / scale,  # Not sure about the -1 here. Maybe so since the last value isn't used in the model for prediction of any new values. also if the prediction length is 1, this doesn't really affect anything
-                ),
-                dim=-1,
-            )  # Shape is (bsz, context_length+(pred_len-1))
-        else:
-            input = scaled_past_target[..., max(self.lags_seq) :]
-        if (past_time_feat is not None) and (future_time_feat is not None):
-            time_feat = (
-                torch.cat(
-                    (
-                        past_time_feat[..., max(self.lags_seq) :, :],
-                        future_time_feat[..., :-1, :],
-                    ),
-                    dim=1,
-                )
-                if future_time_feat is not None
-                else past_time_feat[..., max(self.lags_seq) :, :]
-            )
+        # This is the history used to construct lags
+        prior_input = scaled_past_target  # Use the entire past sequence for lags
 
-        prior_input = (
-            past_target[..., : max(self.lags_seq)] - loc
-        ) / scale  # This the history used to construct lags.  # bsz, max(self.lags_seq)
-
+        # Compute lags using sequence dimension (1)
         lags = lagged_sequence_values(
-            self.lags_seq, prior_input, input, dim=-1
-        )  # Lags are added as an extra dim. Shape is (bsz, context_length+(pred_len-1), len(self.lags_seq))
+            self.lags_seq, prior_input, prior_input, dim=1
+        )  # Lags are added as an extra dim. Shape is (bsz, seq_len, 1, len(self.lags_seq))
 
+        # Combine static features and expand to match sequence length
         static_feat = torch.cat(
             (loc.abs().log1p(), scale.log()), dim=-1
-        )  # (bsz, 2) (loc and scale are concatenated)
-        expanded_static_feat = unsqueeze_expand(
-            static_feat, dim=-2, size=lags.shape[-2]
-        )  # (bsz, context_length+(pred_len-1), 2)
-        # expanded_static_feat: (bsz, context_length+(pred_len-1), len(self.lags_seq) + 2); (bsz, 1); (bsz, 1)
+        )  # [batch_size, 1, 2]
+        static_feat = static_feat.expand(-1, past_target.shape[1], -1)  # [batch_size, seq_len, 2]
 
-        if past_time_feat is not None:
-            return (
-                torch.cat((lags, expanded_static_feat, time_feat), dim=-1),
-                loc,
-                scale,
-            )
-        else:
-            return torch.cat((lags, expanded_static_feat), dim=-1), loc, scale
+        # Combine all features
+        transformer_input = torch.cat(
+            [
+                lags.squeeze(2),  # [batch_size, seq_len, n_lags]
+                scaled_past_target,      # [batch_size, seq_len, 1]
+                past_time_feat,   # [batch_size, seq_len, n_time_features]
+                future_time_feat, # [batch_size, seq_len, n_time_features]
+                static_feat,      # [batch_size, seq_len, 2]
+            ],
+            dim=-1,
+        )
+
+        return transformer_input, loc, scale
 
     def forward(
         self,
         past_target: torch.Tensor,
-        past_observed_values: torch.Tensor,
-        past_time_feat: Optional[torch.Tensor] = None,
-        future_time_feat: Optional[torch.Tensor] = None,
-        future_target: Optional[torch.Tensor] = None,
+        past_time_feat: torch.Tensor,
+        future_time_feat: torch.Tensor,
         use_kv_cache: bool = False,
     ) -> torch.Tensor:
         # if past_time_feat is not None:
         transformer_input, loc, scale = self.prepare_input(
             past_target=past_target,
-            past_observed_values=past_observed_values,
-            future_target=future_target,
             past_time_feat=past_time_feat,
             future_time_feat=future_time_feat,
         )  # return: (bsz, context_length+(pred_len-1), len(self.lags_seq) + 2); (bsz, 1); (bsz, 1)
