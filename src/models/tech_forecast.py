@@ -21,6 +21,7 @@ import traceback
 from pathlib import Path
 import matplotlib.dates as mdates
 import csv
+import argparse
 
 # Monkey-patch torch.distributions.StudentT to define a custom expand method
 from torch.distributions.studentT import StudentT as TorchStudentT
@@ -75,7 +76,7 @@ def create_time_features(idx):
     time_feat[5] = math.cos(2 * math.pi * idx / 365)
     return time_feat
 
-def get_historical_data(tickers=TECH_TICKERS, days=3000):
+def get_historical_data(tickers=TECH_TICKERS, days=3000, production_mode=False):
     """Fetch historical data for given tickers with local caching."""
     # Create data directory if it doesn't exist
     os.makedirs("data", exist_ok=True)
@@ -98,10 +99,17 @@ def get_historical_data(tickers=TECH_TICKERS, days=3000):
                 last_date = cached_data.index[-1]  # Already in UTC
                 days_since_update = (end_date - last_date).days
                 
-                # If data is recent enough (less than 1 day old), use cache
-                if days_since_update < 1:
-                    print("Using cached data (less than 1 day old)")
-                    return cached_data
+                # Production mode: only fetch if there's a new trading day
+                if production_mode:
+                    if days_since_update < 1 or not is_trading_day(last_date + pd.Timedelta(days=1)):
+                        print("Using cached data (no new trading day)")
+                        return cached_data
+                    print("New trading day detected, fetching latest data...")
+                # Development mode: use cache if less than 1 day old
+                else:
+                    if days_since_update < 1:
+                        print("Using cached data (less than 1 day old)")
+                        return cached_data
                 
                 # Update start date to only fetch new data
                 start_date = last_date + pd.Timedelta(days=1)
@@ -559,12 +567,53 @@ def save_forecasts(ticker, forecasts):
     forecast_df.to_csv(output_file, index=False)
     print(f"Saved forecasts for {ticker} to {output_file}")
 
+def is_trading_day(date):
+    """Check if a given date is a trading day (weekday and not a holiday)."""
+    return bool(len(yf.download('^GSPC', start=date, end=date + pd.Timedelta(days=1), progress=False)))
+
+def check_new_trading_day():
+    """Check if there's a new trading day's data available."""
+    cache_file = "data/stock_data_cache.csv"
+    
+    if not os.path.exists(cache_file):
+        return True
+    
+    cached_data = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+    cached_data.index = pd.to_datetime(cached_data.index, utc=True)
+    
+    last_cached_date = cached_data.index[-1]
+    current_date = pd.Timestamp.now(tz='UTC').normalize()
+    
+    # If it's the same calendar day, no new data
+    if last_cached_date.date() == current_date.date():
+        return False
+    
+    # Check if there's been a trading day since last cache
+    return is_trading_day(last_cached_date + pd.Timedelta(days=1))
+
 def main():
-    # Update accuracy of past predictions
-    update_prediction_accuracy()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Stock price forecasting using Lag-Llama model')
+    parser.add_argument('--production', action='store_true', 
+                       help='Run in production mode (only generate predictions for new trading days)')
+    args = parser.parse_args()
+    
+    # In production mode, first check if there's new data
+    if args.production:
+        print("Running in production mode...")
+        if not check_new_trading_day():
+            print("No additional trading day data available. Exiting.")
+            return
+        print("New trading day detected. Generating predictions...")
+    else:
+        print("Running in development mode...")
+    
+    # Update accuracy of past predictions only in production mode
+    if args.production:
+        update_prediction_accuracy()
     
     # Load the model with larger context length
-    print("Loading model...")
+    print("\nLoading model...")
     model = load_lagllama_model(context_length=256)
     model.eval()
     
@@ -572,8 +621,20 @@ def main():
     print("\nFetching stock data...")
     stocks = TECH_TICKERS
     
-    # Fetch all stock data at once
-    data = get_historical_data(tickers=stocks)
+    # Fetch all stock data at once with production mode parameter
+    data = get_historical_data(tickers=stocks, production_mode=args.production)
+    
+    # In production mode, verify we actually got new data
+    if args.production:
+        if data.empty:
+            print("No data available for prediction. Exiting.")
+            return
+        
+        # Verify the data is actually from the latest trading day
+        latest_data_date = data.index[-1]
+        if latest_data_date.date() < pd.Timestamp.now(tz='UTC').normalize().date():
+            print(f"Latest data ({latest_data_date.date()}) is not from current trading day. Exiting.")
+            return
     
     # Create a list to store forecast results
     forecast_results = []
@@ -596,9 +657,26 @@ def main():
                     'Values': values,
                     'Percent Changes': (values - forecast_data['last_historical_value']) / forecast_data['last_historical_value'] * 100
                 })
+                
+                # In production mode, save predictions to history
+                if args.production:
+                    current_date = pd.Timestamp.now(tz='UTC').normalize()
+                    for i, value in enumerate(values):
+                        target_date = current_date + pd.Timedelta(days=i+1)
+                        save_prediction(
+                            ticker=stock,
+                            prediction_date=current_date,
+                            target_date=target_date,
+                            predicted_value=value,
+                            horizon=horizon
+                        )
+                        
         except Exception as e:
             print(f"Error forecasting {stock}: {str(e)}")
             traceback.print_exc()
+            if args.production:
+                # In production mode, log errors more prominently
+                print(f"PRODUCTION ERROR: Failed to generate forecast for {stock}")
     
     # Display results in a simplified table
     if forecast_results:
@@ -643,6 +721,9 @@ def main():
                   f"{stock_results['1w']:>11.2f}% "
                   f"{stock_results['1m']:>11.2f}%")
         print("-"*100)
+
+        if args.production:
+            print("\nProduction run completed successfully. All predictions have been saved.")
 
 if __name__ == '__main__':
     main() 
