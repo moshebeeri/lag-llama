@@ -159,7 +159,7 @@ def validate_dimensions(past_target, past_observed_values, past_time_feat, futur
 
 def prepare_data_for_lagllama(data, dates, model, total_required=752):
     """
-    Prepare data for Lag-Llama model.
+    Prepare data for Lag-Llama model using returns instead of raw prices.
     
     Args:
         data: Historical stock data (pd.Series)
@@ -168,21 +168,24 @@ def prepare_data_for_lagllama(data, dates, model, total_required=752):
         total_required: Minimum number of data points needed
     """
     # Ensure we have enough data
-    if len(data) < total_required:
-        raise ValueError(f"Not enough data points. Need {total_required}, but got {len(data)}")
+    if len(data) < total_required + 1:  # Need extra point for first return
+        raise ValueError(f"Not enough data points. Need {total_required + 1}, but got {len(data)}")
     
-    # Get the last total_required points
-    values = data[-total_required:].values
-    dates = dates[-total_required:]
+    # Calculate returns
+    returns = np.diff(data) / data[:-1]
     
-    # Create future dates for 2-day forecast with same length as past data
+    # Get the required number of returns
+    returns = returns[-(total_required):]
+    dates = dates[-(total_required):]
+    
+    # Create future dates for forecast with same length as past data
     future_dates = pd.date_range(
         start=dates[-1] + pd.Timedelta(days=1),
-        periods=len(dates),  # Match the length of past data
+        periods=len(dates),
         freq='B'
     )
     
-    # Create time features (6 features as expected by the model)
+    # Create time features
     def create_time_features(dates):
         features = []
         # Hour of day
@@ -207,7 +210,7 @@ def prepare_data_for_lagllama(data, dates, model, total_required=752):
     future_time_feat = create_time_features(future_dates)
     
     # Convert to tensors and add batch and feature dimensions
-    past_target = torch.tensor(values, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)  # [1, seq_len, 1]
+    past_target = torch.tensor(returns, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)  # [1, seq_len, 1]
     past_time_feat = torch.tensor(past_time_feat, dtype=torch.float32).unsqueeze(0)     # [1, seq_len, 6]
     future_time_feat = torch.tensor(future_time_feat, dtype=torch.float32).unsqueeze(0)  # [1, seq_len, 6]
     
@@ -292,16 +295,16 @@ def forecast_stock(model, data, dates):
     Returns:
         dict: Dictionary containing forecast information
     """
-    # Prepare data for the model
+    # Prepare data for the model using returns
     past_target, past_time_feat, future_time_feat = prepare_data_for_lagllama(
         data, dates, model
     )
     
-    # Get the last historical value
+    # Get the last historical value for converting returns back to prices
     last_value = float(data.iloc[-1])
     print(f"Last historical value: {last_value:.2f}")
     
-    # Calculate historical volatility and momentum
+    # Calculate historical volatility and momentum using returns
     recent_returns = np.diff(data[-30:].values) / data[-30:-1].values
     daily_std = np.std(recent_returns)
     momentum = np.mean(recent_returns[-5:])  # Use last 5 days for momentum
@@ -321,41 +324,23 @@ def forecast_stock(model, data, dates):
         # Create distribution from parameters
         distr = model.distr_output.distribution(params, loc, scale)
         
-        # Get mean predictions
-        mean = distr.mean.cpu().numpy().squeeze()
+        # Get predicted returns
+        predicted_returns = distr.mean.cpu().numpy().squeeze()
         
-        # Adjust predictions based on stock's characteristics
+        # Convert returns to price forecasts
         forecast_values = np.zeros(2)
         prev_value = last_value
         
         for i in range(2):
-            # Get base prediction and scale it down
-            base_return = mean[i] * 0.05  # Further reduce base prediction
+            # Get the predicted return and apply volatility-based adjustment
+            predicted_return = predicted_returns[i]
             
-            # Calculate individual components
-            volatility_component = (daily_std - 0.015) / 0.015  # Relative to 1.5% baseline
-            momentum_component = momentum * 2
-            trend_component = avg_return
-            
-            # Weight the components differently based on their magnitudes
-            volatility_weight = np.clip(abs(volatility_component), 0, 1)
-            momentum_weight = np.clip(abs(momentum_component), 0, 1)
-            trend_weight = np.clip(abs(trend_component), 0, 1)
-            
-            # Combine components with their weights
-            adjusted_return = (
-                base_return +
-                (volatility_component * 0.003 * volatility_weight) +
-                (momentum_component * 0.002 * momentum_weight) +
-                (trend_component * 0.004 * trend_weight)
-            )
-            
-            # Apply softer bounds based on volatility
-            max_daily_return = daily_std * 1.2  # More flexible cap based on volatility
-            adjusted_return = np.clip(adjusted_return, -max_daily_return, max_daily_return)
+            # Apply volatility-based scaling to the predicted return
+            volatility_scale = np.clip(daily_std / 0.02, 0.5, 2.0)  # Scale based on historical volatility
+            predicted_return = predicted_return / volatility_scale
             
             # Calculate the price prediction
-            forecast_values[i] = prev_value * (1 + adjusted_return)
+            forecast_values[i] = prev_value * (1 + predicted_return)
             prev_value = forecast_values[i]
     
     print(f"Forecast values: {forecast_values[0]:.2f}")
